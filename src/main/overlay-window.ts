@@ -15,7 +15,6 @@
 
 import { BrowserWindow, screen, ipcMain, type Display } from 'electron'
 import { join } from 'path'
-import { is } from '@electron-toolkit/utils'
 import type { AppType, BoxRegions, ScreenRect } from '../core/rpa/types'
 
 // 'unreadIndicator' 步骤已下线 —— 见 OverlayApp.tsx 的注释。BoxSelectDevice
@@ -149,7 +148,7 @@ export async function runBoxSelectWizard(opts: WizardOpenOptions): Promise<Wizar
 
   // overlay 是独立 renderer entry。dev 走 ELECTRON_RENDERER_URL/overlay.html，prod 走 file:。
   const overlayHtml = 'overlay.html'
-  if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
+  if (process.env['ELECTRON_RENDERER_URL']) {
     win.loadURL(`${process.env['ELECTRON_RENDERER_URL']}/${overlayHtml}`)
   } else {
     win.loadFile(join(__dirname, '../renderer', overlayHtml))

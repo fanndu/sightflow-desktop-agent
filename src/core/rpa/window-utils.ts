@@ -1,4 +1,4 @@
-import { screen } from 'electron'
+import { screen, systemPreferences } from 'electron'
 import activeWin from 'active-win'
 import { AppType } from './types'
 import { captureWechatWindow } from './screenshot-utils'
@@ -9,6 +9,11 @@ const IS_MAC = process.platform === 'darwin'
 // 包装带超时的 activeWin 调用
 async function getOpenWindowsSafe(): Promise<any[]> {
   try {
+    if (IS_MAC && !systemPreferences.isTrustedAccessibilityClient(false)) {
+      console.warn('[window-utils] macOS Accessibility permission is not granted; skip window enumeration')
+      return []
+    }
+
     const timeoutPromise = new Promise((_, reject) => {
       setTimeout(() => reject(new Error('active-win getOpenWindows timeout')), 5000)
     })

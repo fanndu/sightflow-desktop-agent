@@ -126,6 +126,21 @@ export class BundleProviderAdapter implements ProviderAdapter {
   }
 }
 
+function ensureProviderRuntimeGlobals(): void {
+  const globals = globalThis as typeof globalThis & {
+    WebSocket?: unknown
+  }
+
+  if (typeof globals.WebSocket !== 'undefined') return
+
+  try {
+    const runtimeRequire = createRequire(__filename)
+    globals.WebSocket = runtimeRequire('undici').WebSocket
+  } catch (error: any) {
+    console.warn('[ProviderBundle] WebSocket runtime polyfill unavailable:', error?.message || error)
+  }
+}
+
 export async function installProviderFromUrl(manifestUrl: string): Promise<ProviderInstallResult> {
   const normalizedUrl = manifestUrl.trim()
   if (!normalizedUrl) {
@@ -276,6 +291,8 @@ export async function loadInstalledProvider(
   installed: InstalledProviderInfo,
   providerConfig: Record<string, any>
 ): Promise<{ provider: ProviderAdapter; manifest: ProviderBundleManifest }> {
+  ensureProviderRuntimeGlobals()
+
   const manifest = await getInstalledProviderManifest(installed)
   if (!manifest) {
     throw new Error('未找到已安装服务的配置清单')

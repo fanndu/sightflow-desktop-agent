@@ -89,6 +89,11 @@ export class GenericChannelSession implements ChannelSession<GenericChannelState
 
       case 'provider.error':
         ctx.host.log('error', `回复服务异常：${event.error}`)
+        if (this.isFatalProviderError(event.error)) {
+          ctx.host.log('error', '回复服务认证失败，引擎已停止。请检查设置里的 API Key 和模型权限。')
+          await ctx.host.stopSession('provider_auth_error')
+          return
+        }
         ctx.host.enqueue({
           type: 'wait_retry',
           reason: 'provider_error',
@@ -276,5 +281,21 @@ export class GenericChannelSession implements ChannelSession<GenericChannelState
 
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms))
+  }
+
+  private isFatalProviderError(error: string): boolean {
+    const lower = error.toLowerCase()
+    return (
+      lower.includes('login_required') ||
+      lower.includes('火山方舟认证失败') ||
+      lower.includes('invalid api key') ||
+      lower.includes('invalid_api_key') ||
+      lower.includes('unauthorized') ||
+      lower.includes('forbidden') ||
+      lower.includes('permission denied') ||
+      lower.includes('api request failed: 401') ||
+      lower.includes('api request failed: 403') ||
+      lower.includes('认证失败')
+    )
   }
 }

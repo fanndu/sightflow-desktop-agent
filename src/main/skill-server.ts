@@ -18,6 +18,7 @@ export type SkillStartReason =
   | 'no_vision_key'
   | 'no_provider'
   | 'missing_required_field'
+  | 'permission_required'
   | 'engine_failed'
   | 'already_running'
   | 'wizard_cancelled'
@@ -87,6 +88,7 @@ const START_STATUS_MAP: Record<SkillStartReason, number> = {
   no_vision_key: 400,
   no_provider: 400,
   missing_required_field: 400,
+  permission_required: 400,
   engine_failed: 500,
   wizard_cancelled: 409
 }
@@ -221,7 +223,7 @@ export function startSkillServer(engineController: SkillEngineController): void 
   }
   controller = engineController
 
-  server = http.createServer((req, res) => {
+  const httpServer = http.createServer((req, res) => {
     requestHandler(req, res).catch((error) => {
       console.error('[Skill Server] Unhandled error:', error)
       try {
@@ -231,23 +233,35 @@ export function startSkillServer(engineController: SkillEngineController): void 
       }
     })
   })
+  server = httpServer
 
-  server.on('error', (err: NodeJS.ErrnoException) => {
-    if (err.code === 'EADDRINUSE' && server) {
+  let attemptedFallback = false
+
+  httpServer.on('listening', () => {
+    const address = httpServer.address()
+    const port = typeof address === 'object' && address ? address.port : PRIMARY_PORT
+    console.log(`[Skill Server] 已启动，监听 http://127.0.0.1:${port}`)
+  })
+
+  httpServer.on('error', (err: NodeJS.ErrnoException) => {
+    if (err.code === 'EADDRINUSE' && !attemptedFallback) {
+      attemptedFallback = true
       console.warn(
         `[Skill Server] 端口 ${PRIMARY_PORT} 被占用，尝试 fallback 端口 ${FALLBACK_PORT}`
       )
-      server.listen(FALLBACK_PORT, '127.0.0.1', () => {
-        console.log(`[Skill Server] 已启动，监听 http://127.0.0.1:${FALLBACK_PORT}`)
-      })
-    } else {
-      console.error('[Skill Server] 启动失败:', err)
+      httpServer.listen(FALLBACK_PORT, '127.0.0.1')
+      return
     }
+
+    console.error('[Skill Server] 启动失败:', err)
+    if (server === httpServer) {
+      server = null
+      controller = null
+    }
+    httpServer.close()
   })
 
-  server.listen(PRIMARY_PORT, '127.0.0.1', () => {
-    console.log(`[Skill Server] 已启动，监听 http://127.0.0.1:${PRIMARY_PORT}`)
-  })
+  httpServer.listen(PRIMARY_PORT, '127.0.0.1')
 }
 
 export function stopSkillServer(): void {

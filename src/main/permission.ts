@@ -1,5 +1,24 @@
 import { systemPreferences, desktopCapturer } from 'electron'
 
+export interface MacPermissionStatus {
+  accessibilityGranted: boolean
+  screenStatus: ReturnType<typeof systemPreferences.getMediaAccessStatus>
+  screenGranted: boolean
+}
+
+export function getMacPermissionStatus(): MacPermissionStatus | null {
+  if (process.platform !== 'darwin') {
+    return null
+  }
+
+  const screenStatus = systemPreferences.getMediaAccessStatus('screen')
+  return {
+    accessibilityGranted: systemPreferences.isTrustedAccessibilityClient(false),
+    screenStatus,
+    screenGranted: screenStatus === 'granted'
+  }
+}
+
 export async function checkAndRequestPermissions(): Promise<void> {
   if (process.platform !== 'darwin') {
     return
@@ -7,17 +26,15 @@ export async function checkAndRequestPermissions(): Promise<void> {
 
   try {
     // 1. 检查并请求辅助功能权限 (Accessibility)
-    const isAccessibilityGranted = systemPreferences.isTrustedAccessibilityClient(false)
-    if (!isAccessibilityGranted) {
-      console.log('[Permission] 辅助功能权限未授权，正在请求...')
-      // 传递 true 会弹出 macOS 系统授权提示框
-      systemPreferences.isTrustedAccessibilityClient(true)
+    const permissionStatus = getMacPermissionStatus()
+    if (!permissionStatus?.accessibilityGranted) {
+      console.log('[Permission] 辅助功能权限未授权，等待用户在系统设置中手动授权')
     } else {
       console.log('[Permission] 已获取辅助功能权限')
     }
 
     // 2. 检查并请求屏幕录制/截图权限 (Screen Capture)
-    const screenStatus = systemPreferences.getMediaAccessStatus('screen')
+    const screenStatus = permissionStatus?.screenStatus || systemPreferences.getMediaAccessStatus('screen')
     if (screenStatus !== 'granted') {
       console.log(`[Permission] 当前屏幕录制权限状态: ${screenStatus}，正在发起请求...`)
       // 在 macOS 上，申请屏幕录制权限通常通过尝试调用 desktopCapturer

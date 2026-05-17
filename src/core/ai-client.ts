@@ -181,7 +181,7 @@ export class AIClient {
       if (!response.ok) {
         const errorText = await response.text()
         console.error(`[AIClient] API 错误: ${response.status}`, errorText)
-        throw new Error(`API request failed: ${response.status} - ${errorText.slice(0, 200)}`)
+        throw new Error(this.createApiErrorMessage(response.status, response.statusText, errorText))
       }
 
       const json = await response.json()
@@ -195,6 +195,10 @@ export class AIClient {
         throw new Error(`AI API 请求超时 (${TIMEOUT_MS / 1000}s)`)
       }
       console.error(`[AIClient] 请求异常 (${elapsed}s):`, error?.message)
+      const message = error?.message || String(error)
+      if (this.isAuthErrorMessage(message) && !message.includes('火山方舟认证失败')) {
+        throw new Error(this.createAuthErrorMessage(message))
+      }
       throw error
     } finally {
       clearTimeout(timer)
@@ -217,5 +221,64 @@ export class AIClient {
   private stripBase64Prefix(base64: string): string {
     const idx = base64.indexOf('base64,')
     return idx !== -1 ? base64.slice(idx + 'base64,'.length) : base64
+  }
+
+  private createApiErrorMessage(status: number, statusText: string, errorText: string): string {
+    const detail = this.parseApiErrorText(errorText)
+    const rawMessage = detail.message || errorText.slice(0, 200) || statusText
+    const rawCode = detail.code || ''
+
+    if (this.isAuthErrorMessage(`${status} ${rawCode} ${rawMessage}`)) {
+      return this.createAuthErrorMessage(rawCode || rawMessage)
+    }
+
+    return `API request failed: ${status} - ${rawMessage.slice(0, 200)}`
+  }
+
+  private createAuthErrorMessage(reason: string): string {
+    const detail = reason.trim() || '认证失败'
+    return `火山方舟认证失败：${detail}。请在设置 → 基础配置重新填写有效 API Key，并确认该 Key 已开通模型 ${this.config.model} 的调用权限。`
+  }
+
+  private parseApiErrorText(errorText: string): { code?: string; message?: string } {
+    try {
+      const data = JSON.parse(errorText)
+      const error = data?.error
+      return {
+        code:
+          this.toText(error?.code) ||
+          this.toText(error?.type) ||
+          this.toText(data?.code) ||
+          this.toText(data?.error_code),
+        message:
+          this.toText(error?.message) ||
+          this.toText(data?.message) ||
+          this.toText(data?.msg) ||
+          this.toText(data?.error)
+      }
+    } catch {
+      return { message: errorText }
+    }
+  }
+
+  private isAuthErrorMessage(message: string): boolean {
+    const lower = message.toLowerCase()
+    return (
+      lower.includes('login_required') ||
+      lower.includes('invalid api key') ||
+      lower.includes('invalid_api_key') ||
+      lower.includes('unauthorized') ||
+      lower.includes('forbidden') ||
+      lower.includes('permission denied') ||
+      lower.includes(' 401 ') ||
+      lower.includes(' 403 ') ||
+      lower.startsWith('401 ') ||
+      lower.startsWith('403 ') ||
+      lower.includes('认证失败')
+    )
+  }
+
+  private toText(value: unknown): string | undefined {
+    return typeof value === 'string' && value.trim() ? value.trim() : undefined
   }
 }
