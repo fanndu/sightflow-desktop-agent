@@ -116,12 +116,45 @@ const getWeChatInputPosition = (bounds: any, scaleFactor: number) => {
 }
 
 /**
+ * 模拟输入法逐字输入效果：将文本按随机 1-3 字符为一块，
+ * 依次写入剪贴板并粘贴，每块之间加 150-300ms 随机延迟，
+ * 视觉上呈现输入法逐字打出的效果。支持中文/英文/混合内容。
+ */
+async function typeTextLikeIME(text: string): Promise<void> {
+  const robot = getRobot()
+  if (!robot) return
+
+  let i = 0
+  while (i < text.length) {
+    // 随机取 1-3 个字符为一块
+    const chunkSize = Math.floor(Math.random() * 3) + 1
+    const chunk = text.slice(i, i + chunkSize)
+    i += chunkSize
+
+    // 写入剪贴板并稳定后粘贴
+    clipboard.writeText(chunk)
+    await randomDelayIn(10, 30)
+
+    if (IS_MAC) {
+      robot.keyTap('v', ['command'])
+    } else {
+      robot.keyTap('v', ['control'])
+    }
+
+    // 字符块间延迟：150-300ms（慢速输入法节奏）
+    if (i < text.length) {
+      await randomDelayIn(150, 300)
+    }
+  }
+}
+
+/**
  * 业务原子 2 — 核心实现：按给定坐标发送消息（不依赖 VLM 缓存）。
  * `sendReplyAction`（VLM 路线）与 `BoxSelectDevice.sendMessage`（框选路线）共用此函数。
  *
  * 1. humanLikeMove → 输入框焦点坐标 (x, y)
  * 2. 隐式鼠标左键点击聚焦
- * 3. 剪贴板 + Cmd/Ctrl+V 粘贴
+ * 3. 逐块粘贴（模拟输入法逐字效果）
  * 4. Enter 发送
  */
 export async function sendReplyByCoordsAction(
@@ -142,16 +175,9 @@ export async function sendReplyByCoordsAction(
     robot.mouseClick('left')
     await randomDelayIn(200, 300)
 
-    clipboard.writeText(text)
-    await randomDelayIn(50, 100)
-
-    if (IS_MAC) {
-      robot.keyTap('v', ['command'])
-    } else {
-      robot.keyTap('v', ['control'])
-    }
-
-    await randomDelayIn(300, 500)
+    // 逐块粘贴，模拟输入法逐字输入效果
+    await typeTextLikeIME(text)
+    await randomDelayIn(100, 200)
 
     robot.keyTap('enter')
 
