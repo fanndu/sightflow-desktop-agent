@@ -31,6 +31,11 @@ import {
   startSkillServer,
   stopSkillServer
 } from './skill-server'
+import { automationLock } from './automation-lock'
+import { ContactStore } from '../core/contact-sync/contact-store'
+import { MacWechatContactDevice } from '../core/contact-sync/mac-wechat-contact-device'
+import { WechatContactSyncSession } from '../core/contact-sync/wechat-contact-sync-session'
+import { ContactSyncProgress } from '../core/contact-sync/contact-types'
 const StoreClass = typeof Store === 'function' ? Store : ((Store as any).default as typeof Store)
 
 const FIXED_ARK_MODEL = 'doubao-seed-2-0-lite-260215'
@@ -129,6 +134,9 @@ const settingsStore = new StoreClass({
 let runtime: RuntimeHost<ReturnType<typeof createInitialGenericChannelState>> | null = null
 let runtimeDevice: DesktopDevice | null = null
 let settingsWindow: BrowserWindow | null = null
+let contactWindow: BrowserWindow | null = null
+let contactSyncSession: WechatContactSyncSession | null = null
+const contactStore = new ContactStore(settingsStore as any)
 
 function createWindow(): void {
   // Create the browser window.
@@ -209,6 +217,52 @@ function createSettingsWindow(): void {
   } else {
     settingsWindow.loadFile(join(__dirname, '../renderer/index.html'), {
       query: { window: 'settings' }
+    })
+  }
+}
+
+function createContactWindow(): void {
+  if (contactWindow && !contactWindow.isDestroyed()) {
+    contactWindow.show()
+    contactWindow.focus()
+    return
+  }
+
+  contactWindow = new BrowserWindow({
+    width: 860,
+    height: 640,
+    minWidth: 720,
+    minHeight: 520,
+    show: false,
+    autoHideMenuBar: true,
+    titleBarStyle: 'hiddenInset',
+    trafficLightPosition: { x: 14, y: 14 },
+    backgroundColor: '#0a0b10',
+    ...(process.platform === 'linux' ? { icon } : {}),
+    webPreferences: {
+      preload: join(__dirname, '../preload/index.js'),
+      sandbox: false
+    }
+  })
+
+  contactWindow.on('ready-to-show', () => {
+    contactWindow?.show()
+  })
+
+  contactWindow.on('closed', () => {
+    contactWindow = null
+  })
+
+  contactWindow.webContents.setWindowOpenHandler((details) => {
+    shell.openExternal(details.url)
+    return { action: 'deny' }
+  })
+
+  if (process.env['ELECTRON_RENDERER_URL']) {
+    contactWindow.loadURL(`${process.env['ELECTRON_RENDERER_URL']}?window=contacts`)
+  } else {
+    contactWindow.loadFile(join(__dirname, '../renderer/index.html'), {
+      query: { window: 'contacts' }
     })
   }
 }
@@ -489,6 +543,40 @@ app.whenReady().then(async () => {
     return { success: true }
   })
 
+  ipcMain.handle('permissions:status', async () => {
+    return getMacPermissionStatus()
+  })
+
+  ipcMain.handle('contacts:open', async () => {
+    createContactWindow()
+    return { success: true }
+  })
+
+  ipcMain.handle('contacts:list', async () => {
+    return contactStore.getListResult()
+  })
+
+  ipcMain.handle('contacts:sync:status', async () => {
+    return {
+      running: contactSyncSession?.getState().running ?? false,
+      state: contactSyncSession?.getState() ?? null,
+      lock: automationLock.snapshot(),
+      list: contactStore.getListResult()
+    }
+  })
+
+  ipcMain.handle('contacts:sync:start', async () => {
+    return startContactSyncCore()
+  })
+
+  ipcMain.handle('contacts:sync:stop', async () => {
+    if (!contactSyncSession?.getState().running) {
+      return { success: false, error: '联系人同步未运行' }
+    }
+    contactSyncSession.requestStop()
+    return { success: true }
+  })
+
   // ── Runtime / Session IPC（沿用 legacy engine:* 通道名） ──
   ipcMain.handle('engine:start', async (_event, config) => {
     const result = await startEngineCore(config)
@@ -640,6 +728,11 @@ async function startEngineCore(rawConfig?: any): Promise<SkillStartResult> {
     return { ok: false, reason: 'already_running', message: '引擎已在运行中' }
   }
 
+  const lock = automationLock.acquire('reply-engine')
+  if (!lock.ok) {
+    return { ok: false, reason: 'already_running', message: lock.message }
+  }
+
   try {
     const settings = normalizeSettings(rawConfig || settingsStore.store)
     const appType: AppType = settings.appType || 'wechat'
@@ -730,12 +823,15 @@ async function startEngineCore(rawConfig?: any): Promise<SkillStartResult> {
 
     runtime.startSession().catch((err: any) => {
       console.error('[Main] Runtime session error:', err)
+      automationLock.release('reply-engine')
+      notifyEngineStateChanged('idle')
     })
 
     notifyEngineStateChanged('running')
 
     return { ok: true }
   } catch (error: any) {
+    automationLock.release('reply-engine')
     return {
       ok: false,
       reason: 'engine_failed',
@@ -785,6 +881,9 @@ async function stopEngineCore(stopReason: string): Promise<SkillPauseResult> {
   }
   try {
     await runtime.stopSession(stopReason)
+    runtime = null
+    runtimeDevice = null
+    automationLock.release('reply-engine')
     notifyEngineStateChanged('idle')
     return { ok: true }
   } catch (error: any) {
@@ -796,11 +895,72 @@ async function stopEngineCore(stopReason: string): Promise<SkillPauseResult> {
   }
 }
 
+async function startContactSyncCore(): Promise<{ success: boolean; error?: string }> {
+  if (contactSyncSession?.getState().running) {
+    return { success: false, error: '联系人同步已在运行中' }
+  }
+  if (process.platform !== 'darwin') {
+    return { success: false, error: '联系人同步当前仅支持 macOS 桌面版个人微信。' }
+  }
+
+  const settings = normalizeSettings(settingsStore.store)
+  if (!settings.vision.apiKey) {
+    return { success: false, error: '请先在设置中填写视觉接口密钥。' }
+  }
+
+  const permissionMessage = getStartupPermissionMessage('vlm')
+  if (permissionMessage) {
+    return { success: false, error: permissionMessage }
+  }
+
+  const lock = automationLock.acquire('contact-sync')
+  if (!lock.ok) {
+    return { success: false, error: lock.message || '已有自动化任务正在运行。' }
+  }
+
+  try {
+    const aiClient = new AIClient({
+      apiKey: settings.vision.apiKey,
+      model: FIXED_ARK_MODEL,
+      baseURL: FIXED_ARK_BASE_URL
+    })
+    const device = new MacWechatContactDevice(
+      aiClient,
+      () => contactSyncSession?.isStopRequested() ?? false
+    )
+    contactSyncSession = new WechatContactSyncSession(device, contactStore, notifyContactSyncState)
+
+    void contactSyncSession.start().finally(() => {
+      automationLock.release('contact-sync')
+      notifyContactSyncState(contactSyncSession?.getState() || null)
+    })
+
+    notifyContactSyncState(contactSyncSession.getState())
+    return { success: true }
+  } catch (error: any) {
+    automationLock.release('contact-sync')
+    contactSyncSession = null
+    return { success: false, error: error?.message || String(error) }
+  }
+}
+
 /** 通知 Renderer 引擎状态变化（让 UI 在远程启停时同步切换） */
 function notifyEngineStateChanged(status: 'running' | 'idle'): void {
   for (const win of BrowserWindow.getAllWindows()) {
     if (!win.isDestroyed()) {
       win.webContents.send('engine:state', { status })
+    }
+  }
+}
+
+function notifyContactSyncState(state: ContactSyncProgress | null): void {
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win.isDestroyed()) {
+      win.webContents.send('contacts:sync:state', {
+        state,
+        list: contactStore.getListResult(),
+        lock: automationLock.snapshot()
+      })
     }
   }
 }

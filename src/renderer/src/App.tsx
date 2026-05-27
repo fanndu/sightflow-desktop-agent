@@ -14,6 +14,21 @@ type SettingsSection = 'base' | 'agent'
 type AppType = 'wechat' | 'wework' | 'dingtalk' | 'lark' | 'slack' | 'telegram' | 'generic'
 
 type CaptureStrategy = 'auto' | 'vlm' | 'box-select'
+type ContactSyncStage =
+  | 'idle'
+  | 'prepare'
+  | 'open-contacts'
+  | 'detect-list'
+  | 'scan-visible-contacts'
+  | 'open-detail'
+  | 'extract-detail'
+  | 'save'
+  | 'skip'
+  | 'fail'
+  | 'scroll-next'
+  | 'complete'
+  | 'stopped'
+  | 'failed'
 
 interface ScreenRect {
   x: number
@@ -32,20 +47,64 @@ interface BoxRegions {
   capturedAt: number
 }
 
-const APP_TYPE_LABELS: Record<AppType, string> = {
-  wechat: '微信',
-  wework: '企业微信',
-  dingtalk: '钉钉',
-  lark: '飞书 / Lark',
-  slack: 'Slack',
-  telegram: 'Telegram',
-  generic: '其他桌面应用'
+interface PermissionStatus {
+  accessibilityGranted: boolean
+  screenGranted: boolean
+  screenStatus: string
 }
 
-const VLM_SUPPORTED_APPS: AppType[] = ['wechat', 'wework']
+interface ContactSyncCounts {
+  totalSeen: number
+  saved: number
+  incomplete: number
+  skipped: number
+  failed: number
+}
 
-function isVlmSupported(appType: AppType): boolean {
-  return VLM_SUPPORTED_APPS.includes(appType)
+interface ContactSyncState {
+  running: boolean
+  stage: ContactSyncStage
+  currentContact: string | null
+  counts: ContactSyncCounts
+  failures: WechatContactFailure[]
+  startedAt: string | null
+  endedAt: string | null
+  error: string | null
+  message?: string
+}
+
+interface WechatContactRecord {
+  wechatId: string
+  nickname: string
+  remark: string
+  tags: string[]
+  region: string
+  source: string
+  status: 'complete' | 'incomplete'
+  missingFields: string[]
+  lastSyncedAt: string
+}
+
+interface WechatContactFailure {
+  id: string
+  visibleName: string
+  wechatId?: string
+  reason: string
+  message: string
+  stage: ContactSyncStage
+  occurredAt: string
+}
+
+interface ContactListResult {
+  contacts: WechatContactRecord[]
+  failures: WechatContactFailure[]
+  summary: {
+    total: number
+    complete: number
+    incomplete: number
+    failures: number
+  }
+  latestRun: unknown | null
 }
 
 interface ProviderSchemaField {
@@ -220,7 +279,9 @@ const RefreshIcon = (): React.JSX.Element => (
 )
 
 function App() {
-  const isSettingsWindow = new URLSearchParams(window.location.search).get('window') === 'settings'
+  const windowKind = new URLSearchParams(window.location.search).get('window')
+  const isSettingsWindow = windowKind === 'settings'
+  const isContactsWindow = windowKind === 'contacts'
   const [status, setStatus] = useState<EngineStatus>('idle')
 
   // Sync UI status with engine state changes triggered out-of-band
@@ -236,6 +297,15 @@ function App() {
     return (
       <div className="app settings-window">
         <SettingsWindow />
+        <Toast />
+      </div>
+    )
+  }
+
+  if (isContactsWindow) {
+    return (
+      <div className="app contacts-window">
+        <ContactsWindow />
         <Toast />
       </div>
     )
@@ -267,73 +337,10 @@ function ControlPanel({
 }) {
   const [logs, setLogs] = useState<LogEntry[]>([])
   const logRef = useRef<HTMLDivElement>(null)
-
-  // 首屏目标应用 + 框选状态：直接读 / 写 settings，让用户上手第一步就能完成。
-  const [appType, setAppType] = useState<AppType>('wechat')
-  const [regions, setRegions] = useState<BoxRegions | null>(null)
-  const [openingWizard, setOpeningWizard] = useState(false)
-
-  const reloadRegionsForApp = useCallback(async (type: AppType) => {
-    const r = (await window.electron?.invoke('capture:getRegions', type)) as BoxRegions | null
-    setRegions(r ?? null)
-  }, [])
-
-  // 初次加载：读出当前 appType + 对应的框选区域
-  useEffect(() => {
-    void (async () => {
-      const settings = (await window.electron?.invoke('settings:getAll')) as
-        | AppSettings
-        | undefined
-      const initial = settings?.appType || 'wechat'
-      setAppType(initial)
-      await reloadRegionsForApp(initial)
-    })()
-  }, [reloadRegionsForApp])
-
-  // 监听 main 进程的"区域已更新"事件——比如向导刚跑完
-  useEffect(() => {
-    const cleanup = window.electron?.on(
-      'capture:regions-updated',
-      (data: { appType: AppType; regions: BoxRegions | null }) => {
-        if (data.appType === appType) setRegions(data.regions)
-      }
-    )
-    return cleanup
-  }, [appType])
-
-  const handleAppTypeChange = useCallback(
-    async (next: AppType) => {
-      if (status === 'running') return
-      setAppType(next)
-      await window.electron?.invoke('settings:set', { appType: next })
-      await window.electron?.invoke('engine:updateConfig', {
-        ...((await window.electron?.invoke('settings:getAll')) as AppSettings),
-        appType: next
-      })
-      await reloadRegionsForApp(next)
-    },
-    [reloadRegionsForApp, status]
-  )
-
-  const handleOpenWizard = useCallback(async () => {
-    if (status === 'running') return
-    setOpeningWizard(true)
-    try {
-      const result = (await window.electron?.invoke('capture:openSetupWizard', {
-        appType
-      })) as { success: boolean; reason?: string; regions?: BoxRegions } | undefined
-      if (result?.success && result.regions) {
-        setRegions(result.regions)
-        showToast('已保存框选区域', 'success')
-      } else if (result?.reason === 'cancelled' || result?.reason === 'closed') {
-        showToast('框选已取消', 'error')
-      } else {
-        showToast('框选失败', 'error')
-      }
-    } finally {
-      setOpeningWizard(false)
-    }
-  }, [appType, status])
+  const [permissions, setPermissions] = useState<PermissionStatus | null>(null)
+  const [contactState, setContactState] = useState<ContactSyncState | null>(null)
+  const [contactList, setContactList] = useState<ContactListResult | null>(null)
+  const [syncStarting, setSyncStarting] = useState(false)
 
   const addLog = useCallback((type: LogEntry['type'], content: string) => {
     const time = new Date().toLocaleTimeString('en-US', { hour12: false })
@@ -345,6 +352,32 @@ function ControlPanel({
       logRef.current.scrollTop = logRef.current.scrollHeight
     }
   }, [logs])
+
+  const loadControllerState = useCallback(async () => {
+    const [permissionStatus, syncStatus, list] = await Promise.all([
+      window.electron?.invoke('permissions:status') as Promise<PermissionStatus | null>,
+      window.electron?.invoke('contacts:sync:status') as Promise<{
+        state: ContactSyncState | null
+        list: ContactListResult
+      }>,
+      window.electron?.invoke('contacts:list') as Promise<ContactListResult>
+    ])
+    setPermissions(permissionStatus || null)
+    setContactState(syncStatus?.state || null)
+    setContactList(syncStatus?.list || list || null)
+  }, [])
+
+  useEffect(() => {
+    void loadControllerState()
+    const cleanup = window.electron?.on(
+      'contacts:sync:state',
+      (payload: { state: ContactSyncState | null; list: ContactListResult }) => {
+        setContactState(payload.state || null)
+        setContactList(payload.list || null)
+      }
+    )
+    return cleanup
+  }, [loadControllerState])
 
   useEffect(() => {
     const cleanup = window.electron?.on('engine:log', (data: { type: string; content: string }) => {
@@ -364,8 +397,35 @@ function ControlPanel({
         ? t('status.error')
         : t('status.idle')
 
-  const isVlm = isVlmSupported(appType)
-  const captureReady = isVlm || regions !== null
+  const contactRunning = contactState?.running === true
+  const permissionReady =
+    window.osInfo?.platform !== 'darwin' ||
+    (permissions?.accessibilityGranted && permissions?.screenGranted)
+
+  const startContactSync = useCallback(async () => {
+    setSyncStarting(true)
+    try {
+      const result = (await window.electron?.invoke('contacts:sync:start')) as
+        | { success: boolean; error?: string }
+        | undefined
+      if (result?.success) {
+        showToast('已开始同步联系人', 'success')
+      } else {
+        showToast(result?.error || '联系人同步启动失败', 'error')
+      }
+    } finally {
+      setSyncStarting(false)
+      void loadControllerState()
+    }
+  }, [loadControllerState])
+
+  const stopContactSync = useCallback(async () => {
+    const result = (await window.electron?.invoke('contacts:sync:stop')) as
+      | { success: boolean; error?: string }
+      | undefined
+    if (result?.success) showToast('已请求停止同步', 'success')
+    else showToast(result?.error || '停止同步失败', 'error')
+  }, [])
 
   return (
     <div className="fade-in">
@@ -374,16 +434,74 @@ function ControlPanel({
         <span className="status-text">{statusLabel}</span>
       </div>
 
-      <TargetAppQuickCard
-        appType={appType}
-        regions={regions}
-        captureReady={captureReady}
-        isVlm={isVlm}
-        openingWizard={openingWizard}
-        running={status === 'running'}
-        onAppTypeChange={handleAppTypeChange}
-        onOpenWizard={handleOpenWizard}
-      />
+      <div className="card controller-card">
+        <div className="card-title">微信状态</div>
+        <div className="controller-row">
+          <span className="controller-label">目标应用</span>
+          <span className="controller-value">桌面版个人微信 · macOS</span>
+        </div>
+        <div className="controller-row">
+          <span className="controller-label">识别方式</span>
+          <span className="controller-value">VLM 视觉识别</span>
+        </div>
+        <div className="permission-line">
+          <span className={`mini-dot ${permissionReady ? 'ok' : 'warn'}`} />
+          <span>
+            {permissionReady
+              ? '辅助功能与屏幕录制权限正常'
+              : '需要开启辅助功能和屏幕录制权限'}
+          </span>
+        </div>
+      </div>
+
+      <div className="card controller-card">
+        <div className="card-title">自动回复</div>
+        <div className="controller-row">
+          <span className="controller-label">状态</span>
+          <span className="controller-value">{statusLabel}</span>
+        </div>
+        <div className="form-hint">底部按钮用于启动或停止微信自动回复。</div>
+      </div>
+
+      <div className="card controller-card">
+        <div className="card-title">联系人同步</div>
+        <div className="contact-sync-metrics">
+          <div>
+            <strong>{contactList?.summary.total ?? 0}</strong>
+            <span>联系人</span>
+          </div>
+          <div>
+            <strong>{contactList?.summary.complete ?? 0}</strong>
+            <span>完整</span>
+          </div>
+          <div>
+            <strong>{contactList?.summary.failures ?? 0}</strong>
+            <span>异常</span>
+          </div>
+        </div>
+        <div className="sync-status-line">
+          <span className={`mini-dot ${contactRunning ? 'ok pulse-dot' : 'idle'}`} />
+          <span>{contactState?.message || (contactRunning ? '同步中' : '未同步')}</span>
+        </div>
+        <div className="sync-actions">
+          {contactRunning ? (
+            <button className="btn btn-danger" onClick={stopContactSync}>
+              停止同步
+            </button>
+          ) : (
+            <button
+              className="btn btn-primary"
+              onClick={startContactSync}
+              disabled={syncStarting || status === 'running'}
+            >
+              {syncStarting ? '启动中...' : '同步联系人'}
+            </button>
+          )}
+          <button className="btn btn-secondary" onClick={() => window.electron?.invoke('contacts:open')}>
+            查看联系人
+          </button>
+        </div>
+      </div>
 
       <div className="card">
         <div className="card-title">{t('control.log')}</div>
@@ -402,123 +520,6 @@ function ControlPanel({
             ))
           )}
         </div>
-      </div>
-    </div>
-  )
-}
-
-interface TargetAppQuickCardProps {
-  appType: AppType
-  regions: BoxRegions | null
-  captureReady: boolean
-  isVlm: boolean
-  openingWizard: boolean
-  running: boolean
-  onAppTypeChange: (t: AppType) => void
-  onOpenWizard: () => void
-}
-
-// 首屏的"目标应用 + 框选"快捷卡片：让新用户开箱即用，不用先翻设置。
-function TargetAppQuickCard({
-  appType,
-  regions,
-  captureReady,
-  isVlm,
-  openingWizard,
-  running,
-  onAppTypeChange,
-  onOpenWizard
-}: TargetAppQuickCardProps): React.JSX.Element {
-  const statusText = isVlm
-    ? '自动识别（VLM）'
-    : regions
-      ? '已框选 3 / 3 个区域'
-      : '尚未框选'
-
-  return (
-    <div className="card" style={{ marginBottom: 12 }}>
-      <div className="card-title">目标应用</div>
-
-      <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
-        <select
-          className="form-input"
-          value={appType}
-          onChange={(e) => onAppTypeChange(e.target.value as AppType)}
-          disabled={running || openingWizard}
-          style={{ flex: 1 }}
-        >
-          {(Object.keys(APP_TYPE_LABELS) as AppType[]).map((type) => (
-            <option key={type} value={type}>
-              {APP_TYPE_LABELS[type]}
-              {!isVlmSupported(type) ? '（框选）' : ''}
-            </option>
-          ))}
-        </select>
-
-        {!isVlm && (
-          <button
-            className="btn btn-primary"
-            onClick={onOpenWizard}
-            disabled={running || openingWizard}
-            style={{
-              whiteSpace: 'nowrap',
-              display: 'inline-flex',
-              alignItems: 'center',
-              gap: 6
-            }}
-          >
-            <svg
-              width="14"
-              height="14"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2.4"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              aria-hidden
-            >
-              {regions ? (
-                // 重新框选 — 旋转刷新图标
-                <>
-                  <path d="M21 12a9 9 0 1 1-3-6.7" />
-                  <path d="M21 4v5h-5" />
-                </>
-              ) : (
-                // 开始框选 — 矩形 + 十字
-                <>
-                  <rect x="3" y="3" width="18" height="18" rx="2" />
-                  <line x1="12" y1="8" x2="12" y2="16" />
-                  <line x1="8" y1="12" x2="16" y2="12" />
-                </>
-              )}
-            </svg>
-            {openingWizard ? '打开中...' : regions ? '重新框选' : '开始框选'}
-          </button>
-        )}
-      </div>
-
-      <div
-        className="form-hint"
-        style={{
-          marginTop: 10,
-          display: 'flex',
-          alignItems: 'center',
-          gap: 8,
-          color: captureReady ? '#94a3b8' : '#fbbf24'
-        }}
-      >
-        <span
-          style={{
-            display: 'inline-block',
-            width: 8,
-            height: 8,
-            borderRadius: 999,
-            background: captureReady ? '#34d399' : '#fbbf24'
-          }}
-        />
-        {statusText}
-        {!isVlm && !regions ? '：点右侧按钮先把 3 个关键区域圈出来' : ''}
       </div>
     </div>
   )
@@ -593,6 +594,204 @@ function BottomBar({
       </button>
     </div>
   )
+}
+
+function ContactsWindow(): React.JSX.Element {
+  const [query, setQuery] = useState('')
+  const [filter, setFilter] = useState<'all' | 'incomplete' | 'failures'>('all')
+  const [data, setData] = useState<ContactListResult | null>(null)
+
+  const loadContacts = useCallback(async () => {
+    const result = (await window.electron?.invoke('contacts:list')) as ContactListResult | undefined
+    setData(result || null)
+  }, [])
+
+  useEffect(() => {
+    void loadContacts()
+    const cleanup = window.electron?.on(
+      'contacts:sync:state',
+      (payload: { list: ContactListResult }) => {
+        setData(payload.list || null)
+      }
+    )
+    return cleanup
+  }, [loadContacts])
+
+  const normalizedQuery = query.trim().toLowerCase()
+  const contacts = (data?.contacts || []).filter((record) => {
+    if (filter === 'incomplete' && record.status !== 'incomplete') return false
+    if (filter === 'failures') return false
+    if (!normalizedQuery) return true
+    return [
+      record.nickname,
+      record.wechatId,
+      record.remark,
+      record.tags.join(' '),
+      record.region,
+      record.source
+    ]
+      .join(' ')
+      .toLowerCase()
+      .includes(normalizedQuery)
+  })
+
+  const failures = (data?.failures || []).filter((failure) => {
+    if (filter !== 'failures') return false
+    if (!normalizedQuery) return true
+    return [failure.visibleName, failure.wechatId, failure.reason, failure.message]
+      .join(' ')
+      .toLowerCase()
+      .includes(normalizedQuery)
+  })
+
+  return (
+    <div className="contacts-shell">
+      <header className="contacts-header">
+        <div>
+          <h1>微信联系人</h1>
+          <p>同步后的联系人详情和异常记录</p>
+        </div>
+        <button className="btn btn-secondary" onClick={loadContacts}>
+          刷新
+        </button>
+      </header>
+
+      <div className="contacts-toolbar">
+        <input
+          className="form-input"
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          placeholder="搜索昵称、微信号、备注、标签、地区、来源"
+        />
+        <div className="segmented">
+          <button className={filter === 'all' ? 'active' : ''} onClick={() => setFilter('all')}>
+            全部
+          </button>
+          <button
+            className={filter === 'incomplete' ? 'active' : ''}
+            onClick={() => setFilter('incomplete')}
+          >
+            不完整
+          </button>
+          <button
+            className={filter === 'failures' ? 'active' : ''}
+            onClick={() => setFilter('failures')}
+          >
+            失败
+          </button>
+        </div>
+      </div>
+
+      <div className="contacts-table-wrap">
+        {filter === 'failures' ? (
+          <table className="contacts-table">
+            <thead>
+              <tr>
+                <th>联系人</th>
+                <th>微信号</th>
+                <th>阶段</th>
+                <th>原因</th>
+                <th>时间</th>
+              </tr>
+            </thead>
+            <tbody>
+              {failures.map((failure) => (
+                <tr key={failure.id}>
+                  <td>{failure.visibleName}</td>
+                  <td>{failure.wechatId || '-'}</td>
+                  <td>{getStageLabel(failure.stage)}</td>
+                  <td>{failure.message || failure.reason}</td>
+                  <td>{formatTime(failure.occurredAt)}</td>
+                </tr>
+              ))}
+              {failures.length === 0 ? <EmptyTableRow colSpan={5} text="暂无失败记录" /> : null}
+            </tbody>
+          </table>
+        ) : (
+          <table className="contacts-table">
+            <thead>
+              <tr>
+                <th>昵称</th>
+                <th>微信号</th>
+                <th>备注</th>
+                <th>标签</th>
+                <th>地区</th>
+                <th>来源</th>
+                <th>状态</th>
+                <th>最后同步</th>
+              </tr>
+            </thead>
+            <tbody>
+              {contacts.map((record) => (
+                <tr key={record.wechatId}>
+                  <td>{record.nickname}</td>
+                  <td>{record.wechatId}</td>
+                  <td>{record.remark || '-'}</td>
+                  <td>{record.tags.length ? record.tags.join('、') : '-'}</td>
+                  <td>{record.region || '-'}</td>
+                  <td>{record.source || '-'}</td>
+                  <td>
+                    <span className={`status-pill ${record.status}`}>{record.status === 'complete' ? '完整' : '不完整'}</span>
+                  </td>
+                  <td>{formatTime(record.lastSyncedAt)}</td>
+                </tr>
+              ))}
+              {contacts.length === 0 ? <EmptyTableRow colSpan={8} text="暂无联系人" /> : null}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      <footer className="contacts-footer">
+        <span>总数 {data?.summary.total ?? 0}</span>
+        <span>完整 {data?.summary.complete ?? 0}</span>
+        <span>不完整 {data?.summary.incomplete ?? 0}</span>
+        <span>失败 {data?.summary.failures ?? 0}</span>
+      </footer>
+    </div>
+  )
+}
+
+function EmptyTableRow({ colSpan, text }: { colSpan: number; text: string }): React.JSX.Element {
+  return (
+    <tr>
+      <td colSpan={colSpan} className="empty-cell">
+        {text}
+      </td>
+    </tr>
+  )
+}
+
+function getStageLabel(stage: ContactSyncStage): string {
+  const labels: Record<ContactSyncStage, string> = {
+    idle: '空闲',
+    prepare: '准备',
+    'open-contacts': '打开通讯录',
+    'detect-list': '识别列表',
+    'scan-visible-contacts': '扫描联系人',
+    'open-detail': '打开详情',
+    'extract-detail': '读取详情',
+    save: '保存',
+    skip: '跳过',
+    fail: '失败',
+    'scroll-next': '滚动',
+    complete: '完成',
+    stopped: '已停止',
+    failed: '失败'
+  }
+  return labels[stage] || stage
+}
+
+function formatTime(value: string | null | undefined): string {
+  if (!value) return '-'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value
+  return date.toLocaleString('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit'
+  })
 }
 
 function SettingsWindow(): React.JSX.Element {
